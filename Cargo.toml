@@ -1,9 +1,10 @@
 [package]
 name = "actor-lite"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "基于 tokio 的轻量 actor 抽象，提供命令通道、状态/进度广播和事件通知"
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/KOPZWMZ/actor_kit.git"
 [dependencies]
 tokio = { version = "1.53.1", features = ["macros", "sync", "rt", "time"] }
