@@ -47,7 +47,7 @@ actor-lite = "0.0.1"
 ## 定义一个 actor
 
  ```no_run
- use actor_kit::{Actor, ActorContext};
+ use actor_lite::{Actor, ActorContext};
  use std::future::Future;
 
  struct MyActor;
@@ -86,24 +86,25 @@ actor-lite = "0.0.1"
  当需要统一管理多个同类型 actor 时，使用 [`manager::ActorManager`]：
 
  ```no_run
- use actor_kit::manager::{ActorManager, ManagerCmd, ManagerEvent};
- # use actor_kit::{Actor, ActorContext};
- # use std::future::Future;
- # struct MyActor;
- # impl Actor for MyActor {
- #     type Cmd = ();
- #     type Event = ();
- #     type State = ();
- #     type Progress = ();
- #     fn init_state_and_progress(&self) -> (Self::State, Self::Progress) { ((), ()) }
- #     fn run(self, context: ActorContext<Self>) -> impl Future<Output = ()> + Send + 'static { async {} }
- # }
- # async fn example() {
+ use actor_lite::manager::{ActorManager, ManagerCmd, ManagerEvent};
+ use actor_lite::{Actor, ActorContext};
+ use std::future::Future;
+  struct MyActor;
+  impl Actor for MyActor {
+      type Cmd = ();
+      type Event = ();
+      type State = ();
+      type Progress = ();
+      fn init_state_and_progress(&self) -> (Self::State, Self::Progress) { ((), ()) }
+      fn run(self, context: ActorContext<Self>) -> impl Future<Output = ()> + Send + 'static { async {} }
+  }
+  async fn example() {
  // ActorManager 本身也是 Actor，直接 spawn 即可
  let handle = ActorManager::<MyActor>::new().spawn();
 
- // 启动子 actor（通过事件通知分配的 id）
- handle.send_cmd(ManagerCmd::SpawnActor(MyActor)).await.unwrap();
+ let (id_tx,id_rx) = tokio::sync::oneshot::channel();
+ handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).await.unwrap();
+ let id = id_rx.await.unwrap();
 
  // 读取所有子 actor 的聚合状态
  let state = handle.get_state();

@@ -43,7 +43,6 @@ async fn counter_handles_inc() {
     handle.send_cmd(Cmd::Inc).await.unwrap();
     handle.state_listen_async(|state| async move {
         assert_eq!(state, 1);
-        false
     });
     tokio::time::sleep(Duration::from_secs(2)).await;
     handle.stop();

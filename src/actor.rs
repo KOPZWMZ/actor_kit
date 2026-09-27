@@ -22,7 +22,7 @@ use tracing::debug;
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_kit::{Actor, ActorContext};
+/// # use actor_lite::{Actor, ActorContext};
 /// struct Counter {
 ///     target: u32,
 /// }
@@ -101,8 +101,8 @@ pub trait Actor: Sized + Send + 'static {
         let (event_tx, _) = broadcast::channel(Self::EVENT_CAPACITY);
         let (progress_tx, progress_rx) = watch::channel(init_progress);
         let cancel = CancelToken::new();
-        let handle_cancel = CancelHandle { cancel };
-        let context_cancel = handle_cancel.clone();
+
+        let context_cancel = cancel.clone();
 
         let context = ActorContext {
             cmd_rx,
@@ -116,7 +116,7 @@ pub trait Actor: Sized + Send + 'static {
             event_tx,
             state_rx,
             progress_rx,
-            cancel: handle_cancel,
+            cancel,
         };
         (context, handle)
     }
@@ -132,6 +132,7 @@ pub trait Actor: Sized + Send + 'static {
         let (init_state, init_progress) = self.init_state_and_progress();
         let (context, handle) = Self::channel(init_state, init_progress);
         tokio::spawn(self.run(context));
+        debug!("spawn actor: {}", std::any::type_name::<Self>());
         handle
     }
     /// actor的主要循环
@@ -145,7 +146,7 @@ pub trait Actor: Sized + Send + 'static {
     /// # 示例
     ///
     /// ```no_run
-    ///  # use actor_kit::{Actor, ActorHandle, ActorContext};
+    ///  # use actor_lite::{Actor, ActorHandle, ActorContext};
     /// struct MyActor;
     /// impl Actor for MyActor {
     ///     type Cmd = ();
@@ -183,7 +184,7 @@ pub trait Actor: Sized + Send + 'static {
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_kit::{Actor, ActorHandle, ActorContext};
+/// # use actor_lite::{Actor, ActorHandle, ActorContext};
 /// # struct MyActor;
 /// # impl Actor for MyActor {
 /// #    type Cmd = ();
@@ -203,17 +204,17 @@ pub trait Actor: Sized + Send + 'static {
 /// handle.send_cmd(()).await.unwrap();
 /// let state = handle.get_state();
 ///
-/// let listener = handle.state_listen_async(|s| async move { true });
+/// let listener = handle.state_listen_async(|s| async move { });
 /// listener.cancel();
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+
 pub struct ActorHandle<A: Actor> {
     cmd_tx: mpsc::Sender<A::Cmd>,
     state_rx: watch::Receiver<A::State>,
     event_tx: broadcast::Sender<A::Event>,
     progress_rx: watch::Receiver<A::Progress>,
-    cancel: CancelHandle,
+    cancel: CancelToken,
 }
 
 impl<A: Actor> ActorHandle<A> {
@@ -232,10 +233,10 @@ impl<A: Actor> ActorHandle<A> {
     ///
     /// 返回的 [`ListenerHandle`] 被 drop 或调用 `cancel()` 时停止监听。
 
-    pub fn state_listen_async<F, Fut>(&self, mut op: F) -> CancelHandle
+    pub fn state_listen_async<F, Fut>(&self, mut op: F) -> CancelToken
     where
         F: FnMut(A::State) -> Fut + Send + 'static,
-        Fut: Future<Output = bool> + Send,
+        Fut: Future<Output = ()> + Send,
     {
         let token = CancelToken::new();
         let wait_token = token.clone();
@@ -243,31 +244,30 @@ impl<A: Actor> ActorHandle<A> {
         let listen = async move {
             loop {
                 tokio::select! {
-                    _ = wait_token.cancelled() => break,
-                    result = rx.changed() => {
-                        match result {
-                        Ok(())=>{
-                            let state = rx.borrow_and_update().to_owned();
-                             if !op(state).await{
-                                break;
-                            }
+                _ = wait_token.cancelled() => break,
+                result = rx.changed() => {
+                    match result {
+                    Ok(())=>{
+                        let state = rx.borrow_and_update().to_owned();
+                         op(state).await;
                         }
-                        Err(_) => {break}}
-                    }
+
+                    Err(_) => break}
+                }
                 }
             }
         };
         tokio::spawn(listen);
-        CancelHandle { cancel: token }
+        token
     }
     /// 获取 actor 的最新进度。
     pub fn get_progress(&self) -> A::Progress {
         self.progress_rx.borrow().to_owned()
     }
-    pub fn progress_listen_async<F, Fut>(&self, mut op: F) -> CancelHandle
+    pub fn progress_listen_async<F, Fut>(&self, mut op: F) -> CancelToken
     where
         F: FnMut(A::Progress) -> Fut + Send + 'static,
-        Fut: Future<Output = bool> + Send,
+        Fut: Future<Output = ()> + Send,
     {
         let token = CancelToken::new();
         let wait_token = token.clone();
@@ -280,26 +280,24 @@ impl<A: Actor> ActorHandle<A> {
                         match result {
                         Ok(())=>{
                             let progress = rx.borrow_and_update().to_owned();
-                             if !op(progress).await{
-                                break;
-                            }
+                            op(progress).await;
                         }
-                        Err(_) => {break}}
+                        Err(_) => break}
                     }// 幂等、同步、永不失败
                 }
             }
         };
         tokio::spawn(listen);
-        CancelHandle { cancel: token }
+        token
     }
 
     pub fn get_events_rx(&self) -> broadcast::Receiver<A::Event> {
         self.event_tx.subscribe()
     }
-    pub fn events_listen_async<F, Fut>(&self, mut op: F) -> CancelHandle
+    pub fn events_listen_async<F, Fut>(&self, mut op: F) -> CancelToken
     where
         F: FnMut(A::Event) -> Fut + Send + 'static,
-        Fut: Future<Output = bool> + Send,
+        Fut: Future<Output = ()> + Send,
     {
         let mut rx = self.event_tx.subscribe();
         let token = CancelToken::new();
@@ -310,25 +308,34 @@ impl<A: Actor> ActorHandle<A> {
                     _ = wait_token.cancelled() => break,
                     result = rx.recv() => {
                         match result {
-                            Ok(e) => { if  !op(e).await { break; } }
+                            Ok(e) => { op(e).await; }
                             Err(broadcast::error::RecvError::Closed) => break,
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 debug!("事件监听落后 {n} 条");
-                                break;
-                            // 继续，或 break，看语义
+                                continue;
                         }
                     }}
                 }
             }
         };
         tokio::spawn(listen);
-        CancelHandle { cancel: token }
+        token
     }
     pub fn stop(&self) {
         self.cancel.cancel();
     }
 }
-
+impl<A: Actor> Clone for ActorHandle<A> {
+    fn clone(&self) -> Self {
+        Self {
+            cmd_tx: self.cmd_tx.clone(),
+            state_rx: self.state_rx.clone(),
+            event_tx: self.event_tx.clone(),
+            progress_rx: self.progress_rx.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
+}
 /// actor 的后台端。
 ///
 /// 由 [`Actor::channel`] 创建，通常由后台任务持有。
@@ -338,7 +345,7 @@ pub struct ActorContext<A: Actor> {
     state_tx: watch::Sender<A::State>,
     event_tx: broadcast::Sender<A::Event>,
     progress_tx: watch::Sender<A::Progress>,
-    cancel: CancelHandle,
+    cancel: CancelToken,
 }
 impl<A: Actor> ActorContext<A> {
     /// 获取额外的事件发送端。
@@ -366,7 +373,7 @@ impl<A: Actor> ActorContext<A> {
         self.cmd_rx.try_recv().ok()
     }
 
-    pub fn cancel_clone(&self) -> CancelHandle {
+    pub fn cancel_clone(&self) -> CancelToken {
         self.cancel.clone()
     }
 }
@@ -381,7 +388,7 @@ impl<A: Actor> ActorContext<A> {
 /// `CancelToken` 是 `Clone` 的，clone 出来的所有副本共享同一个取消信号。
 /// 任意一份 `cancel()` 都会让所有副本的 `cancelled()` 返回。
 #[derive(Clone, Debug)]
-struct CancelToken {
+pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
@@ -413,33 +420,5 @@ impl CancelToken {
         if !self.cancelled.swap(true, Ordering::AcqRel) {
             self.notify.notify_waiters();
         }
-    }
-}
-/// 监听句柄。
-///
-/// 由 `state_listen_async` / `progress_listen_async` / `events_listen_async` 返回。
-/// 调用 [`CancelHandle::cancel`] 或直接 drop 都会停止对应的监听任务。
-#[derive(Debug, Clone)]
-pub struct CancelHandle {
-    cancel: CancelToken,
-}
-
-impl CancelHandle {
-    pub fn cancel(&self) {
-        self.cancel.cancel();
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancel.is_cancelled()
-    }
-
-    pub async fn cancelled(&self) {
-        self.cancel.cancelled().await;
-    }
-}
-
-impl Drop for CancelHandle {
-    fn drop(&mut self) {
-        self.cancel.cancel();
     }
 }

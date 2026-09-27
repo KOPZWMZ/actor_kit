@@ -19,8 +19,8 @@
 //! # 示例
 //!
 //! ```no_run
-//! # use actor_kit::{Actor, ActorContext, ActorHandle};
-//! # use actor_kit::manager::{ActorManager, ManagerCmd, ManagerState, ManagerProgress, ManagerEvent};
+//! # use actor_lite::{Actor, ActorContext, ActorHandle};
+//! # use actor_lite::manager::{ActorManager, ManagerCmd, ManagerState, ManagerProgress, ManagerEvent};
 //! # struct MyActor;
 //! # impl Actor for MyActor {
 //! #     type Cmd = ();
@@ -37,9 +37,9 @@
 //! let manager = ActorManager::<MyActor>::new();
 //! let handle = manager.spawn();
 //!
-//! // 启动一个子 actor
-//! handle.send_cmd(ManagerCmd::SpawnActor(MyActor)).await.unwrap();
-//!
+//! let (id_tx,id_rx) = tokio::sync::oneshot::channel();
+//! handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).await.unwrap();
+//! let id = id_rx.await.unwrap();
 //! // 读取所有子 actor 的状态
 //! let state: ManagerState<()> = handle.get_state();
 //! assert_eq!(state.len(), 1);
@@ -52,10 +52,10 @@
 //! # }
 //! ```
 
-use crate::actor::{Actor, ActorContext, ActorHandle, CancelHandle};
+use crate::actor::{Actor, ActorContext, ActorHandle, CancelToken};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Duration;
 
 /// 子 actor 管理器。
@@ -74,8 +74,8 @@ use tokio::time::Duration;
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_kit::{Actor, ActorContext};
-/// # use actor_kit::manager::{ActorManager, ManagerCmd};
+/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::manager::{ActorManager, ManagerCmd};
 /// # struct MyActor;
 /// # impl Actor for MyActor {
 /// #     type Cmd = ();
@@ -92,7 +92,10 @@ use tokio::time::Duration;
 /// let handle = manager.spawn();
 ///
 /// // 启动子 actor，返回分配的 id
-/// handle.send_cmd(ManagerCmd::SpawnActor(MyActor)).await.unwrap();
+/// let (id_tx,id_rx) = tokio::sync::oneshot::channel();
+/// handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).await.unwrap();
+/// let id = id_rx.await.unwrap();
+
 /// # }
 /// ```
 pub struct ActorManager<A: Actor> {
@@ -124,7 +127,6 @@ impl<A: Actor> ActorManager<A> {
     fn get_id(&self) -> usize {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
-
     fn spawn_actor(
         &mut self,
         actor: A,
@@ -163,12 +165,11 @@ impl<A: Actor> ActorManager<A> {
         handle: &ActorHandle<A>,
         id: usize,
         update_tx: mpsc::Sender<Update>,
-    ) -> CancelHandle {
+    ) -> CancelToken {
         handle.state_listen_async(move |_| {
             let state_tx = update_tx.clone();
             async move {
                 let _ = state_tx.send(Update::State(id)).await;
-                true
             }
         })
     }
@@ -177,26 +178,23 @@ impl<A: Actor> ActorManager<A> {
         handle: &ActorHandle<A>,
         id: usize,
         update_tx: mpsc::Sender<Update>,
-    ) -> CancelHandle {
+    ) -> CancelToken {
         handle.progress_listen_async(move |_| {
             let progress_tx = update_tx.clone();
             async move {
                 let _ = progress_tx.send(Update::Progress(id)).await;
-                true
             }
         })
     }
-
     fn listen_events(
         handle: &ActorHandle<A>,
         id: usize,
         event_tx: broadcast::Sender<ManagerEvent<A::Event>>,
-    ) -> CancelHandle {
+    ) -> CancelToken {
         handle.events_listen_async(move |event| {
             let events_tx = event_tx.clone();
             async move {
                 let _ = events_tx.send(ManagerEvent::ChildEvent { id, event });
-                true
             }
         })
     }
@@ -223,11 +221,14 @@ impl<A: Actor> Actor for ActorManager<A> {
             push_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => { tracing::error!("Manager 被 cancel 了！");break},
                     Some(cmd) = context.wait_for_cmd() => {
                         match cmd {
-                            ManagerCmd::SpawnActor(actor) => {
+                            ManagerCmd::SpawnActor{actor, id_tx} => {
                                 let id = manager.spawn_actor(actor, update_tx.clone(), context.get_events_clone());
+                                if let Some(tx) = id_tx{
+                                    let _ = tx.send(id);
+                                }
                                 let _ = context.send_event(ManagerEvent::Spawned { id });
                             }
                             ManagerCmd::StopActor(id) => {
@@ -275,9 +276,9 @@ enum Update {
 }
 
 struct CancelListeners {
-    state: CancelHandle,
-    progress: CancelHandle,
-    events: CancelHandle,
+    state: CancelToken,
+    progress: CancelToken,
+    events: CancelToken,
 }
 
 impl CancelListeners {
@@ -296,15 +297,15 @@ impl CancelListeners {
 ///
 /// | 变体 | 说明 |
 /// |------|------|
-/// | [`ManagerCmd::SpawnActor`] | 启动一个新的子 actor，返回分配的 `id`（通过事件通知） |
+/// | [`ManagerCmd::SpawnActor`] | 启动一个新的子 actor，可以选择返回分配的 `id`（通过oneshot通道） |
 /// | [`ManagerCmd::StopActor`] | 停止指定 `id` 的子 actor |
 /// | [`ManagerCmd::Forward`] | 向指定 `id` 的子 actor 转发一条命令 |
 ///
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_kit::{Actor, ActorContext};
-/// # use actor_kit::manager::{ActorManager, ManagerCmd};
+/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::manager::{ActorManager, ManagerCmd};
 /// # struct MyActor;
 /// # impl Actor for MyActor {
 /// #     type Cmd = String;
@@ -320,8 +321,9 @@ impl CancelListeners {
 /// let handle = ActorManager::<MyActor>::new().spawn();
 ///
 /// // 启动子 actor
-/// handle.send_cmd(ManagerCmd::SpawnActor(MyActor)).await.unwrap();
-///
+/// let (id_tx,id_rx) = tokio::sync::oneshot::channel();
+/// handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).await.unwrap();
+/// let id = id_rx.await.unwrap();
 /// // 转发命令给 id=1 的子 actor
 /// handle.send_cmd(ManagerCmd::Forward { id: 1, cmd: "hello".into() }).await.unwrap();
 ///
@@ -329,11 +331,15 @@ impl CancelListeners {
 /// handle.send_cmd(ManagerCmd::StopActor(1)).await.unwrap();
 /// # }
 /// ```
+
 pub enum ManagerCmd<A: Actor> {
     /// 启动一个新的子 actor。
     ///
     /// 管理器会为其分配唯一 `id`，并通过 [`ManagerEvent::Spawned`] 事件通知。
-    SpawnActor(A),
+    SpawnActor {
+        actor: A,
+        id_tx: Option<oneshot::Sender<usize>>,
+    },
     /// 停止指定 `id` 的子 actor。
     ///
     /// 停止后通过 [`ManagerEvent::Stopped`] 事件通知。
@@ -352,8 +358,8 @@ pub enum ManagerCmd<A: Actor> {
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_kit::{Actor, ActorContext};
-/// # use actor_kit::manager::{ActorManager, ManagerState};
+/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::manager::{ActorManager, ManagerState};
 /// # struct MyActor;
 /// # impl Actor for MyActor {
 /// #     type Cmd = ();
@@ -417,8 +423,8 @@ impl<State> ManagerState<State> {
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_kit::{Actor, ActorContext};
-/// # use actor_kit::manager::{ActorManager, ManagerProgress};
+/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::manager::{ActorManager, ManagerProgress};
 /// # struct MyActor;
 /// # impl Actor for MyActor {
 /// #     type Cmd = ();
@@ -482,8 +488,8 @@ impl<Progress> ManagerProgress<Progress> {
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_kit::{Actor, ActorContext};
-/// # use actor_kit::manager::{ActorManager, ManagerEvent};
+/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::manager::{ActorManager, ManagerEvent};
 /// # struct MyActor;
 /// # impl Actor for MyActor {
 /// #     type Cmd = ();
