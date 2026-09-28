@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
-use tracing::debug;
+use tracing::{trace, warn};
 /// Actor 模型的核心 trait。
 ///
 /// 实现此 trait 来定义一个 actor 的行为。每个 actor 有四个关联类型：
@@ -89,7 +89,7 @@ pub trait Actor: Sized + Send + 'static {
     /// actor 的命令通道容量
     const CMD_CAPACITY: usize = 16;
     /// actor 的事件通道容量
-    const EVENT_CAPACITY: usize = 16;
+    const EVENT_CAPACITY: usize = 32;
     /// 创建 actor 的通道。
     /// ActorContext 是 actor 的后台端，ActorHandle 是 actor 的控制端。
     fn channel(
@@ -132,7 +132,7 @@ pub trait Actor: Sized + Send + 'static {
         let (init_state, init_progress) = self.init_state_and_progress();
         let (context, handle) = Self::channel(init_state, init_progress);
         tokio::spawn(self.run(context));
-        debug!("spawn actor: {}", std::any::type_name::<Self>());
+        trace!("spawn actor: {}", std::any::type_name::<Self>());
         handle
     }
     /// actor的主要循环
@@ -220,7 +220,11 @@ pub struct ActorHandle<A: Actor> {
 impl<A: Actor> ActorHandle<A> {
     /// 向 actor 发送一条命令。
     pub async fn send_cmd(&self, cmd: A::Cmd) -> Result<(), mpsc::error::SendError<A::Cmd>> {
-        self.cmd_tx.send(cmd).await
+        if let Err(e) = self.cmd_tx.send(cmd).await {
+            warn!("send cmd failed: channel closed");
+            return Err(e);
+        }
+        Ok(())
     }
     /// 获取 actor 的最新状态。
     pub fn get_state(&self) -> A::State {
@@ -311,7 +315,7 @@ impl<A: Actor> ActorHandle<A> {
                             Ok(e) => { op(e).await; }
                             Err(broadcast::error::RecvError::Closed) => break,
                             Err(broadcast::error::RecvError::Lagged(n)) => {
-                                debug!("事件监听落后 {n} 条");
+                                warn!("事件监听落后 {n} 条");
                                 continue;
                         }
                     }}

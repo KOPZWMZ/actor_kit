@@ -57,6 +57,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Duration;
+use tracing::debug;
 
 /// 子 actor 管理器。
 ///
@@ -98,15 +99,16 @@ use tokio::time::Duration;
 
 /// # }
 /// ```
-pub struct ActorManager<A: Actor> {
+pub struct ActorManager<A: Actor, const C: usize = 32, const E: usize = 256> {
     actors: HashMap<usize, ActorHandle<A>>,
     next_id: AtomicUsize,
     state: ManagerState<A::State>,
     progress: ManagerProgress<A::Progress>,
     listeners: HashMap<usize, CancelListeners>,
+    update_interval: Duration,
 }
 
-impl<A: Actor> ActorManager<A> {
+impl<A: Actor, const C: usize, const E: usize> ActorManager<A, C, E> {
     /// 创建一个空的 `ActorManager`。
     ///
     /// 初始时不管理任何子 actor，需要启动后通过 [`ManagerCmd::SpawnActor`] 添加。
@@ -121,9 +123,12 @@ impl<A: Actor> ActorManager<A> {
                 actors: HashMap::new(),
             },
             listeners: HashMap::new(),
+            update_interval: Duration::from_millis(500),
         }
     }
-
+    pub fn set_update_interval(&mut self, interval: Duration) {
+        self.update_interval = interval;
+    }
     fn get_id(&self) -> usize {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
@@ -200,11 +205,13 @@ impl<A: Actor> ActorManager<A> {
     }
 }
 
-impl<A: Actor> Actor for ActorManager<A> {
+impl<A: Actor, const C: usize, const E: usize> Actor for ActorManager<A, C, E> {
     type Cmd = ManagerCmd<A>;
     type State = ManagerState<A::State>;
     type Progress = ManagerProgress<A::Progress>;
     type Event = ManagerEvent<A::Event>;
+    const CMD_CAPACITY: usize = C;
+    const EVENT_CAPACITY: usize = E;
 
     fn init_state_and_progress(&self) -> (Self::State, Self::Progress) {
         (self.state.clone(), self.progress.clone())
@@ -217,11 +224,11 @@ impl<A: Actor> Actor for ActorManager<A> {
 
         async move {
             let (update_tx, mut update_rx) = mpsc::channel::<Update>(256);
-            let mut push_interval = tokio::time::interval(Duration::from_secs(1));
+            let mut push_interval = tokio::time::interval(manager.update_interval);
             push_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => { tracing::error!("Manager 被 cancel 了！");break},
+                    _ = cancel.cancelled() => { debug!("Manager 被 cancel 了！");break},
                     Some(cmd) = context.wait_for_cmd() => {
                         match cmd {
                             ManagerCmd::SpawnActor{actor, id_tx} => {
